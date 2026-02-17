@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Rhythm Game</title>
+<style>
+    body { margin: 0; background: #111; color: #fff; font-family: sans-serif; }
+    #menu { position: absolute; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; flex-direction: column; }
+    .song-button { padding: 10px 20px; margin: 10px; cursor: pointer; background: #222; color: #fff; border: 1px solid #555; border-radius: 5px; }
+    #gameCanvas { display: block; width: 100vw; height: 100vh; background: #000; }
+    #hud { position: absolute; top: 10px; left: 10px; font-size: 18px; }
+</style>
+</head>
+<body>
+
+<div id="menu">
+    <h1>Выберите песню</h1>
+    <div id="songButtons"></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+<div id="hud">
+    <div>Очки: <span id="score">0</span></div>
+    <div>Комбо: <span id="combo">0</span></div>
+    <div>Точность: <span id="accuracy">0%</span></div>
+</div>
+
+<audio id="audio"></audio>
+
+<!-- Tone.js MIDI -->
+<script src="https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.27/build/Midi.js"></script>
+
+<script>
+// ------------------ Глобальные переменные ------------------
+let audioContext, analyser, micStream, dataArray, currentPitch = null;
+let audio = document.getElementById("audio");
+let canvas = document.getElementById("gameCanvas");
+let ctx = canvas.getContext("2d");
+let ball = { x: 150, y: 200, radius: 20 };
+let obstacles = [];
+let subtitles = [];
+let currentSubtitle = "";
+let score = 0, combo = 0, accuracy = 0;
+
+// ------------------ Голосовой анализ ------------------
+function autoCorrelate(buffer, sampleRate) {
+    let SIZE = buffer.length;
+    let rms = 0;
+    for (let i = 0; i < SIZE; i++) rms += buffer[i]*buffer[i];
+    rms = Math.sqrt(rms / SIZE);
+    if (rms < 0.01) return null;
+
+    let r = new Array(SIZE).fill(0);
+    for (let lag=0; lag<SIZE; lag++)
+        for (let i=0; i<SIZE-lag; i++)
+            r[lag] += buffer[i] * buffer[i+lag];
+
+    let d=0; while(r[d]>r[d+1]) d++;
+    let maxval=-1, maxpos=-1;
+    for(let i=d;i<SIZE;i++){
+        if(r[i]>maxval){ maxval=r[i]; maxpos=i; }
+    }
+    let T0 = maxpos;
+    if(T0===0) return null;
+    return sampleRate / T0;
+}
+
+function updatePitch() {
+    if (!analyser) return null;
+    analyser.getFloatTimeDomainData(dataArray);
+    let freq = autoCorrelate(dataArray, audioContext.sampleRate);
+    currentPitch = freq;
+    return freq;
+}
+
+async function initMic() {
+    if (!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
+    if (audioContext.state==="suspended") await audioContext.resume();
+
+    try {
+        micStream = await navigator.mediaDevices.getUserMedia({audio:true});
+        const micSource = audioContext.createMediaStreamSource(micStream);
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        micSource.connect(analyser);
+        dataArray = new Float32Array(analyser.fftSize);
+        console.log("Микрофон подключён");
+    } catch(err){
+        alert("Ошибка микрофона: "+err);
+        throw err;
+    }
+}
+
+// ------------------ MIDI и препятствия ------------------
+async function loadMidi(url){
+    const response = await fetch(url);
+    const arrayBuffer = await response.arrayBuffer();
+    const midi = new Midi(arrayBuffer);
+    window.currentMidi = midi;
+    createObstaclesFromMidi(midi);
+}
+
+function createObstaclesFromMidi(midi){
+    obstacles = [];
+    midi.tracks.forEach(track => {
+        track.notes.forEach(note => {
+            obstacles.push({
+                time: note.time,
+                note: note.midi,
+                y: mapMidiToY(note.midi),
+                hit: false
+            });
+        });
+    });
+}
+
+function mapMidiToY(midiNote){
+    const minY = 50, maxY = canvas.height - 50;
+    const minNote = 40, maxNote = 80;
+    midiNote = Math.max(minNote, Math.min(maxNote, midiNote));
+    return maxY - (midiNote - minNote)/(maxNote - minNote)*(maxY-minY);
+}
+
+// ------------------ SRT субтитры ------------------
+async function loadSRT(url){
+    const res = await fetch(url);
+    const text = await res.text();
+    parseSRT(text);
+}
+
+function parseSRT(text){
+    subtitles = [];
+    const blocks = text.split("\n\n");
+    blocks.forEach(block=>{
+        const lines = block.split("\n");
+        if(lines.length>=3){
+            const times = lines[1].split(" --> ");
+            const start = parseTime(times[0]);
+            const end = parseTime(times[1]);
+            const subtitleText = lines.slice(2).join("\n");
+            subtitles.push({start,end,text:subtitleText});
+        }
+    });
+}
+
+function parseTime(timeStr){
+    const parts = timeStr.split(/[:,]/);
+    return parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseInt(parts[2]) + parseInt(parts[3])/1000;
+}
+
+function updateSubtitles(){
+    const t = audio.currentTime;
+    const sub = subtitles.find(s=> t>=s.start && t<=s.end);
+    currentSubtitle = sub ? sub.text : "";
+}
+
+// ------------------ Голосовое движение ------------------
+function mapFreqToY(freq){
+    if(!freq) return ball.y;
+    let minFreq=100, maxFreq=1000;
+    let minY=50, maxY=canvas.height-50;
+    freq = Math.max(minFreq, Math.min(maxFreq, freq));
+    return maxY - (freq-minFreq)/(maxFreq-minFreq)*(maxY-minY);
+}
+
+// ------------------ GameLoop ------------------
+function gameLoop(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    updatePitch();
+    ball.y = mapFreqToY(currentPitch);
+
+    let currentTime = audio.currentTime;
+
+    // рисуем препятствия
+    obstacles.forEach(obs=>{
+        let x = canvas.width - (currentTime-obs.time)*200;
+        if(x>-20){
+            ctx.fillStyle = obs.hit?"#00f":"#f00";
+            ctx.fillRect(x, obs.y-10, 20, 20);
+
+            // попадание
+            if(!obs.hit && Math.abs(ball.y-obs.y)<30 && Math.abs(x-ball.x)<20){
+                obs.hit = true;
+                score += 10;
+                combo += 1;
+                accuracy = Math.min(100,accuracy+5);
+                document.getElementById("score").textContent = score;
+                document.getElementById("combo").textContent = combo;
+                document.getElementById("accuracy").textContent = accuracy + "%";
+            }
+        }
+    });
+
+    // шарик
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.radius,0,2*Math.PI);
+    ctx.fillStyle = "#0f0";
+    ctx.fill();
+
+    // субтитры
+    updateSubtitles();
+    ctx.fillStyle="#fff";
+    ctx.font="20px sans-serif";
+    ctx.textAlign="center";
+    ctx.fillText(currentSubtitle, canvas.width/2, canvas.height-30);
+
+    requestAnimationFrame(gameLoop);
+}
+
+// ------------------ Старт игры ------------------
+async function startGame(song){
+    document.getElementById("menu").style.display="none";
+    await initMic();
+    audio.src = song.audio;
+    await loadMidi(song.midi);
+    await loadSRT(song.lyrics);
+    audio.play();
+    gameLoop();
+}
+
+// ------------------ Меню песен ------------------
+const songs = [
+    { title: "Song 1", audio:"songs/song1.mp3", midi:"songs/song1.mid", lyrics:"songs/song1.srt" }
+];
+
+const songButtonsDiv = document.getElementById("songButtons");
+songs.forEach(song=>{
+    let btn = document.createElement("div");
+    btn.className = "song-button";
+    btn.textContent = song.title;
+    btn.onclick = ()=>startGame(song);
+    songButtonsDiv.appendChild(btn);
+});
+</script>
+
+</body>
+</html>
