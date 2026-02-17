@@ -1,0 +1,8 @@
+[
+  {
+    "title": "Song 1",
+    "audio": "songs/song1.mp3",
+    "midi": "songs/song1.mid",
+    "lyrics": "songs/song1.srt"
+  }
+]
